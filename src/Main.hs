@@ -25,6 +25,7 @@ import           Miso
 import           Miso.Html
 import           Miso.JSON
 import           Miso.Html.Property hiding (label_)
+import qualified Miso.Lens as Lens
 import qualified Miso.String as S
 import qualified Miso.CSS as CSS
 ----------------------------------------------------------------------------
@@ -36,11 +37,26 @@ foreign export javascript "hs_start" main :: IO ()
 ----------------------------------------------------------------------------
 data Model
   = Model
+  { inlineOpen :: Bool
+  , inlineTodo :: TodoModel
+  , componentOpen :: Bool
+  , componentTodo :: TodoModel
+  } deriving stock (Show, Generic, Eq)
+    deriving anyclass (FromJSON, ToJSON)
+----------------------------------------------------------------------------
+data ComponentModel
+  = ComponentModel
+  { componentOpenChild :: Bool
+  , componentTodoChild :: TodoModel
+  } deriving stock (Show, Generic, Eq)
+    deriving anyclass (FromJSON, ToJSON)
+----------------------------------------------------------------------------
+data TodoModel
+  = TodoModel
   { entries :: [Entry]
   , field :: MisoString
   , uid :: Int
   , visibility :: MisoString
-  , step :: Bool
   } deriving stock (Show, Generic, Eq)
     deriving anyclass (FromJSON, ToJSON)
 ----------------------------------------------------------------------------
@@ -57,11 +73,26 @@ data Entry
 emptyModel :: Model
 emptyModel
   = Model
+  { inlineOpen = False
+  , inlineTodo = emptyTodoModel
+  , componentOpen = False
+  , componentTodo = emptyTodoModel
+  }
+----------------------------------------------------------------------------
+emptyComponentModel :: ComponentModel
+emptyComponentModel
+  = ComponentModel
+  { componentOpenChild = False
+  , componentTodoChild = emptyTodoModel
+  }
+----------------------------------------------------------------------------
+emptyTodoModel :: TodoModel
+emptyTodoModel
+  = TodoModel
   { entries = []
   , visibility = "All"
   , field = mempty
   , uid = 0
-  , step = False
   }
 ----------------------------------------------------------------------------
 newEntry :: MisoString -> Int -> Entry
@@ -75,8 +106,17 @@ newEntry desc eid
   }
 ----------------------------------------------------------------------------
 data Msg
+  = ToggleInline
+  | InlineTodo TodoMsg
+  deriving (Show)
+----------------------------------------------------------------------------
+data ComponentMsg
+  = ToggleComponent
+  | ComponentTodo TodoMsg
+  deriving (Show)
+----------------------------------------------------------------------------
+data TodoMsg
   = NoOp
-  | CurrentTime Int
   | UpdateField MisoString
   | EditingEntry Int Bool
   | UpdateEntry Int MisoString
@@ -86,7 +126,6 @@ data Msg
   | Check Int Bool
   | CheckAll Bool
   | ChangeVisibility MisoString
-  | FocusOnInput
   deriving (Show)
 ----------------------------------------------------------------------------
 main :: IO ()
@@ -94,90 +133,178 @@ main = startApp (defaultEvents <> keyboardEvents) app
 ----------------------------------------------------------------------------
 app :: App Model Msg
 app = (component emptyModel updateModel viewModel)
-  { initialAction = Just FocusOnInput
 #ifdef VANILLA
   -- dmj: when using vanilla GHC append the styles to <head> in dev mode
-  , styles =
+  { styles =
       [ Href "https://cdn.jsdelivr.net/npm/todomvc-common@1.0.5/base.min.css"
       , Href "https://cdn.jsdelivr.net/npm/todomvc-app-css@2.4.3/index.min.css"
       ]
-#endif
   }
+#else
+  { styles = [] }
+#endif
+----------------------------------------------------------------------------
+componentExample :: Component Model ComponentModel ComponentMsg
+componentExample =
+  (component emptyComponentModel updateComponent viewComponentExample)
+    { bindings =
+        [ componentOpenLens <--> componentModelOpenLens
+        , componentTodoLens <--> componentModelTodoLens
+        ]
+    }
 ----------------------------------------------------------------------------
 updateModel :: Msg -> Transition Model Msg
 updateModel = \case
-  NoOp ->
-    pure ()
-  FocusOnInput ->
-    io_ (focus "input-box")
-  CurrentTime time ->
-    io_ $ consoleLog $ S.ms (show time)
-  Add -> do
-    model@Model{..} <- get
-    put model
-      { uid = uid + 1
-      , field = mempty
-      , entries = entries <> [newEntry field uid | not $ S.null field]
-      }
-  UpdateField str ->
-    modify update
-      where
-        update m = m { field = str }
-  EditingEntry id' isEditing ->
-    modify $ \m ->
-      m { entries =
-            filterMap (entries m) (\t -> eid t == id') $ \t ->
+  ToggleInline ->
+    modify $ \m -> m { inlineOpen = not (inlineOpen m) }
+  InlineTodo msg ->
+    modify $ \m -> m { inlineTodo = updateTodo msg (inlineTodo m) }
+----------------------------------------------------------------------------
+updateComponent :: ComponentMsg -> Effect Model ComponentModel ComponentMsg
+updateComponent = \case
+  ToggleComponent ->
+    modify $ \m -> m { componentOpenChild = not (componentOpenChild m) }
+  ComponentTodo msg ->
+    modify $ \m -> m { componentTodoChild = updateTodo msg (componentTodoChild m) }
+----------------------------------------------------------------------------
+updateTodo :: TodoMsg -> TodoModel -> TodoModel
+updateTodo msg model@TodoModel{..} =
+  case msg of
+    NoOp ->
+      model
+    Add ->
+      model
+        { uid = uid + 1
+        , field = mempty
+        , entries = entries <> [newEntry field uid | not $ S.null field]
+        }
+    UpdateField str ->
+      model { field = str }
+    EditingEntry id' isEditing ->
+      model
+        { entries =
+            filterMap entries (\t -> eid t == id') $ \t ->
               t { editing = isEditing
                 , focussed = isEditing
                 }
         }
-  UpdateEntry id' task ->
-    modify $ \m -> m
-      { entries = filterMap (entries m) ((== id') . eid) $ \t ->
-          t { description = task }
-      }
-  Delete id' -> 
-    modify $ \m -> m
-     { entries = filter (\t -> eid t /= id') (entries m)
-     }
-  DeleteComplete ->
-    modify $ \m -> m
-      { entries = filter (not . completed) (entries m)
-      }
-  Check id' isCompleted ->
-    modify $ \m -> m
-      { entries =
-          filterMap (entries m) (\t -> eid t == id') $ \t ->
-            t { completed = isCompleted }
-      }
-  CheckAll isCompleted ->
-    modify $ \m -> m
-      { entries =
-          filterMap (entries m) (const True) $ \t ->
-            t { completed = isCompleted }
-      }
-  ChangeVisibility v ->
-    modify $ \m -> m { visibility = v }
+    UpdateEntry id' task ->
+      model
+        { entries =
+            filterMap entries ((== id') . eid) $ \t ->
+              t { description = task }
+        }
+    Delete id' ->
+      model
+        { entries = filter (\t -> eid t /= id') entries
+        }
+    DeleteComplete ->
+      model
+        { entries = filter (not . completed) entries
+        }
+    Check id' isCompleted ->
+      model
+        { entries =
+            filterMap entries (\t -> eid t == id') $ \t ->
+              t { completed = isCompleted }
+        }
+    CheckAll isCompleted ->
+      model
+        { entries =
+            filterMap entries (const True) $ \t ->
+              t { completed = isCompleted }
+        }
+    ChangeVisibility v ->
+      model { visibility = v }
 ----------------------------------------------------------------------------
 filterMap :: [a] -> (a -> Bool) -> (a -> a) -> [a]
 filterMap xs p f = [ if p x then f x else x | x <- xs ]
 ----------------------------------------------------------------------------
-viewModel :: Model -> View model Msg
-viewModel m@Model{..} =
+viewModel :: Model -> View Model Msg
+viewModel model =
     div_
         [ class_ "todomvc-wrapper"
         ]
         [ section_
-            [class_ "todoapp"]
-            [ viewInput m field
-            , viewEntries visibility entries
-            , viewControls m visibility entries
+            [ class_ "examples"
+            ]
+            [ h1_ [] [ text "Miso component vs inline" ]
+            , section_
+                [ class_ "example-block"
+                ]
+                [ h2_ [] [ text "Component example" ]
+                , "component-example" +> componentExample
+                ]
+            , section_
+                [ class_ "example-block"
+                ]
+                [ h2_ [] [ text "Inline example" ]
+                , inlineExampleView model
+                ]
             ]
         , infoFooter
         ]
 ----------------------------------------------------------------------------
-viewEntries :: MisoString -> [Entry] -> View model Msg
-viewEntries visibility entries =
+viewComponentExample :: ComponentModel -> View ComponentModel ComponentMsg
+viewComponentExample ComponentModel{..} =
+    ul_
+        [ class_ "example-list"
+        ]
+        $ [ componentToggleItem ]
+        <> componentChildren
+  where
+    componentToggleItem =
+      li_ []
+        [ button_
+            [ class_ "example-button"
+            , onClick ToggleComponent
+            ]
+            [ text "Open contrived example - component" ]
+        ]
+    componentChildren =
+      case componentOpenChild of
+        False -> []
+        True ->
+          [ li_ []
+              [ fmap ComponentTodo (viewTodoApp "component" componentTodoChild) ]
+          ]
+----------------------------------------------------------------------------
+inlineExampleView :: Model -> View Model Msg
+inlineExampleView Model{..} =
+    ul_
+        [ class_ "example-list"
+        ]
+        $ [ inlineToggleItem ]
+        <> inlineChildren
+  where
+    inlineToggleItem =
+      li_ []
+        [ button_
+            [ class_ "example-button"
+            , onClick ToggleInline
+            ]
+            [ text "Open contrived example - inline" ]
+        ]
+    inlineChildren =
+      case inlineOpen of
+        False -> []
+        True ->
+          [ li_ []
+              [ fmap InlineTodo (viewTodoApp "inline" inlineTodo) ]
+          ]
+----------------------------------------------------------------------------
+viewTodoApp :: MisoString -> TodoModel -> View model TodoMsg
+viewTodoApp prefix TodoModel{..} =
+    section_
+        [ class_ "todoapp"
+        ]
+        [ viewInput prefix field
+        , viewEntries prefix visibility entries
+        , viewControls visibility entries
+        ]
+----------------------------------------------------------------------------
+viewEntries :: MisoString -> MisoString -> [Entry] -> View model TodoMsg
+viewEntries prefix visibility entries =
     section_
         [ class_ "main"
         , CSS.style_ [ CSS.visibility cssVisibility ]
@@ -186,16 +313,16 @@ viewEntries visibility entries =
             [ class_ "toggle-all"
             , type_ "checkbox"
             , name_ "toggle"
-            , id_ "toggle-all"
+            , id_ (todoId prefix "toggle-all")
             , checked_ allCompleted
             , onClick $ CheckAll (not allCompleted)
             ]
         , label_
-            [for_ "toggle-all"]
-            [text $ S.pack "Mark all as complete"]
-        , ul_ [class_ "todo-list"] $
+            [ for_ (todoId prefix "toggle-all") ]
+            [ text $ S.pack "Mark all as complete" ]
+        , ul_ [ class_ "todo-list" ] $
             flip map (filter isVisible entries) $ \t ->
-                viewKeyedEntry t
+                viewKeyedEntry prefix t
         ]
   where
     cssVisibility = bool "visible" "hidden" (null entries)
@@ -206,11 +333,11 @@ viewEntries visibility entries =
             "Active" -> not completed
             _ -> True
 ----------------------------------------------------------------------------
-viewKeyedEntry :: Entry -> View model Msg
+viewKeyedEntry :: MisoString -> Entry -> View model TodoMsg
 viewKeyedEntry = viewEntry
 ----------------------------------------------------------------------------
-viewEntry :: Entry -> View model Msg
-viewEntry Entry{..} =
+viewEntry :: MisoString -> Entry -> View model TodoMsg
+viewEntry prefix Entry{..} =
     li_
         [ class_ $
             S.intercalate " " $
@@ -218,7 +345,7 @@ viewEntry Entry{..} =
         , key_ eid
         ]
         [ div_
-            [class_ "view"]
+            [ class_ "view" ]
             [ input_
                 [ class_ "toggle"
                 , type_ "checkbox"
@@ -226,8 +353,8 @@ viewEntry Entry{..} =
                 , onClick $ Check eid (not completed)
                 ]
             , label_
-                [onDoubleClick (EditingEntry eid True) ]
-                [text description]
+                [ onDoubleClick (EditingEntry eid True) ]
+                [ text description ]
             , button_
                 [ class_ "destroy"
                 , onClick $ Delete eid
@@ -238,41 +365,41 @@ viewEntry Entry{..} =
             [ class_ "edit"
             , value_ description
             , name_ "title"
-            , id_ ("todo-" <> S.ms eid)
+            , id_ (todoId prefix ("todo-" <> S.ms eid))
             , onInput (UpdateEntry eid)
             , onBlur (EditingEntry eid False)
             , onEnter NoOp (EditingEntry eid False)
             ]
         ]
 ----------------------------------------------------------------------------
-viewControls :: Model -> MisoString -> [Entry] -> View model Msg
-viewControls model visibility entries =
+viewControls :: MisoString -> [Entry] -> View model TodoMsg
+viewControls visibility entries =
     footer_
         [ class_ "footer"
         , hidden_ (null entries)
         ]
         [ viewControlsCount entriesLeft
         , viewControlsFilters visibility
-        , viewControlsClear model entriesCompleted
+        , viewControlsClear entriesCompleted
         ]
   where
     entriesCompleted = length . filter completed $ entries
     entriesLeft = length entries - entriesCompleted
 ----------------------------------------------------------------------------
-viewControlsCount :: Int -> View model Msg
+viewControlsCount :: Int -> View model TodoMsg
 viewControlsCount entriesLeft =
     span_
-        [class_ "todo-count"]
-        [ strong_ [] [text $ S.ms entriesLeft]
+        [ class_ "todo-count" ]
+        [ strong_ [] [ text $ S.ms entriesLeft ]
         , text (item_ <> " left")
         ]
   where
     item_ = S.pack $ bool " items" " item" (entriesLeft == 1)
 ----------------------------------------------------------------------------
-viewControlsFilters :: MisoString -> View model Msg
+viewControlsFilters :: MisoString -> View model TodoMsg
 viewControlsFilters visibility =
     ul_
-        [class_ "filters"]
+        [ class_ "filters" ]
         [ visibilitySwap "#/" "All" visibility
         , text " "
         , visibilitySwap "#/active" "Active" visibility
@@ -280,7 +407,7 @@ viewControlsFilters visibility =
         , visibilitySwap "#/completed" "Completed" visibility
         ]
 ----------------------------------------------------------------------------
-visibilitySwap :: MisoString -> MisoString -> MisoString -> View model Msg
+visibilitySwap :: MisoString -> MisoString -> MisoString -> View model TodoMsg
 visibilitySwap uri visibility actualVisibility =
     li_
         []
@@ -289,26 +416,26 @@ visibilitySwap uri visibility actualVisibility =
             , class_ $ S.concat ["selected" | visibility == actualVisibility]
             , onClick (ChangeVisibility visibility)
             ]
-            [text visibility]
+            [ text visibility ]
         ]
 ----------------------------------------------------------------------------
-viewControlsClear :: Model -> Int -> View model Msg
-viewControlsClear _ entriesCompleted =
+viewControlsClear :: Int -> View model TodoMsg
+viewControlsClear entriesCompleted =
     button_
         [ class_ "clear-completed"
         , prop "hidden" (entriesCompleted == 0)
         , onClick DeleteComplete
         ]
-        [text $ "Clear completed (" <> S.ms entriesCompleted <> ")"]
+        [ text $ "Clear completed (" <> S.ms entriesCompleted <> ")" ]
 ----------------------------------------------------------------------------
-viewInput :: Model -> MisoString -> View model Msg
-viewInput _ task =
+viewInput :: MisoString -> MisoString -> View model TodoMsg
+viewInput prefix task =
     header_
-        [class_ "header"]
-        [ h1_ [] [text "todos"]
+        [ class_ "header" ]
+        [ h1_ [] [ text "todos" ]
         , input_
             [ class_ "new-todo"
-            , id_ "input-box"
+            , id_ (todoId prefix "input-box")
             , placeholder_ "What needs to be done?"
             , autofocus_ True
             , value_ task
@@ -318,20 +445,43 @@ viewInput _ task =
             ]
         ]
 ----------------------------------------------------------------------------
+todoId :: MisoString -> MisoString -> MisoString
+todoId prefix suffix = prefix <> "-" <> suffix
+----------------------------------------------------------------------------
+componentOpenLens :: Lens.Lens Model Bool
+componentOpenLens =
+  Lens.lens componentOpen $ \model value ->
+    model { componentOpen = value }
+----------------------------------------------------------------------------
+componentTodoLens :: Lens.Lens Model TodoModel
+componentTodoLens =
+  Lens.lens componentTodo $ \model value ->
+    model { componentTodo = value }
+----------------------------------------------------------------------------
+componentModelOpenLens :: Lens.Lens ComponentModel Bool
+componentModelOpenLens =
+  Lens.lens componentOpenChild $ \model value ->
+    model { componentOpenChild = value }
+----------------------------------------------------------------------------
+componentModelTodoLens :: Lens.Lens ComponentModel TodoModel
+componentModelTodoLens =
+  Lens.lens componentTodoChild $ \model value ->
+    model { componentTodoChild = value }
+----------------------------------------------------------------------------
 infoFooter :: View model Msg
 infoFooter =
     footer_
-        [class_ "info"]
-        [ p_ [] [text "Double-click to edit a todo"]
+        [ class_ "info" ]
+        [ p_ [] [ text "Double-click to edit a todo" ]
         , p_
             []
             [ text "Written by "
-            , a_ [href_ "https://github.com/dmjio"] [text "@dmjio"]
+            , a_ [ href_ "https://github.com/dmjio" ] [ text "@dmjio" ]
             ]
         , p_
             []
             [ text "Part of "
-            , a_ [href_ "http://todomvc.com"] [text "TodoMVC"]
+            , a_ [ href_ "http://todomvc.com" ] [ text "TodoMVC" ]
             ]
         ]
 ----------------------------------------------------------------------------
